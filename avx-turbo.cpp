@@ -187,7 +187,9 @@ args::ValueFlag<std::string> arg_spec{parser, "SPEC", "Run a specific type of te
 args::ValueFlag<size_t> arg_iters{parser, "ITERS", "Run the test loop ITERS times (default 100000)", {"iters"}, 100000};
 args::ValueFlag<int> arg_min_threads{parser, "MIN", "The minimum number of threads to use", {"min-threads"}, 1};
 args::ValueFlag<int> arg_max_threads{parser, "MAX", "The maximum number of threads to use", {"max-threads"}};
+args::ValueFlag<int> arg_inc_threads{parser, "INC", "The thread count increment between min and max", {"inc-threads"}, 1};
 args::ValueFlag<uint64_t> arg_warm_ms{parser, "MILLISECONDS", "Warmup milliseconds for each thread after pinning (default 100)", {"warmup-ms"}, 100};
+args::ValueFlag<std::string> arg_cpuids{parser, "CPUIDS", "Comma-separated list of CPU IDs to pin threads to (default sequential ids)", {"cpuids"}};
 
 
 bool verbose;
@@ -278,8 +280,8 @@ struct aperf_ghz : outer_timer {
      */
     static bool is_supported() {
         uint64_t dummy;
-        return     read_msr_cur_cpu(MSR_IA32_MPERF, &dummy) == 0
-                && read_msr_cur_cpu(MSR_IA32_APERF, &dummy) == 0;
+        return     read_msr(1, MSR_IA32_MPERF, &dummy) == 0
+                && read_msr(1, MSR_IA32_APERF, &dummy) == 0;
     }
 
     virtual void start() override {
@@ -509,8 +511,8 @@ std::vector<test_spec> make_default_tests(ISA isas_supported, std::vector<int> c
     } else {
         funcs.insert(funcs.begin(), std::begin(ALL_FUNCS), std::end(ALL_FUNCS));
     }
-
-    for (size_t thread_count = arg_min_threads.Get(); thread_count <= maxcpus; thread_count++) {
+    size_t inc = arg_inc_threads.Get();
+    for (size_t thread_count = arg_min_threads.Get(); thread_count <= maxcpus; thread_count+=inc) {
         for (const auto& t : funcs) {
             if (should_run(t, isas_supported)) {
                 try_add(t, thread_count);
@@ -613,6 +615,7 @@ struct warmup {
 
 struct test_thread {
     size_t id;
+    size_t cpu_id;
     hot_barrier* start_barrier;
     hot_barrier* stop_barrier;
 
@@ -626,8 +629,8 @@ struct test_thread {
 
     std::thread thread;
 
-    test_thread(size_t id, hot_barrier& start_barrier, hot_barrier& stop_barrier, const test_func *test, size_t iters, bool use_aperf) :
-        id{id}, start_barrier{&start_barrier}, stop_barrier{&stop_barrier}, test{test},
+    test_thread(size_t id, size_t cpu_id, hot_barrier& start_barrier, hot_barrier& stop_barrier, const test_func *test, size_t iters, bool use_aperf) :
+        id{id}, cpu_id{cpu_id}, start_barrier{&start_barrier}, stop_barrier{&stop_barrier}, test{test},
         iters{iters}, use_aperf{use_aperf}, thread{std::ref(*this)}
     {
         // if (verbose) printf("Constructed test in thread %lu, this = %p\n", id, this);
@@ -640,7 +643,8 @@ struct test_thread {
     void operator()() {
         // if (verbose) printf("Running test in thread %lu, this = %p\n", id, this);
         if (!arg_no_pin) {
-            pin_to_cpu(id);
+            if (verbose) printf("Pinning thread %lu to CPU %lu\n", id, cpu_id);
+            pin_to_cpu(cpu_id);
         }
         aperf_ghz aperf_timer;
         outer_timer& outer = use_aperf ? static_cast<outer_timer&>(aperf_timer) : dummy_outer::dummy;
@@ -830,6 +834,18 @@ int main(int argc, char** argv) {
     zeroupper();
     auto specs = filter_tests(isas_supported, cpus);
 
+    // parse comma separate list of cpu_ids into an array
+    std::vector<int> cpu_ids;
+    if (arg_cpuids) {
+        for (auto& id : split(arg_cpuids.Get(), ",")) {
+            cpu_ids.push_back(std::atoi(id.c_str()));
+        }
+    } else {
+        for (int i = 0; i < (int)cpus.size(); i++) {
+            cpu_ids.push_back(i);
+        }
+    }
+
     size_t last_thread_count = -1u;
     std::vector<result_holder> results_list;
     for (auto& spec : specs) {
@@ -848,7 +864,7 @@ int main(int argc, char** argv) {
         std::deque<test_thread> threads;
         hot_barrier start{spec.count()}, stop{spec.count()};
         for (auto& test : spec.thread_funcs) {
-            threads.emplace_back(threads.size(), start, stop, &test, iters, use_aperf);
+            threads.emplace_back(threads.size(), cpu_ids[threads.size()], start, stop, &test, iters, use_aperf);
         }
 
         results_list.emplace_back(&spec);
